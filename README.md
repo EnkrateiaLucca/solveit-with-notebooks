@@ -42,6 +42,9 @@ export OPENAI_API_KEY=sk-...        # uses GPT
 
 # 2. dependencies
 pip install anthropic openai ipywidgets jupyterlab
+# optional extras:
+#   pip install docling        # upload_pdf() — high-fidelity PDF → notebook (pymupdf is a lighter fallback)
+#   pip install google-genai   # generate_visual_analogy() via Gemini "nano banana pro"
 
 # 3. open the guided class
 jupyter lab notebooks/01-python-basics-solveit.ipynb
@@ -79,6 +82,8 @@ Override the model anytime: `configure(model="gpt-5")` or env `SOLVEIT_MODEL`.
 | `cmd.<TAB>` | Reusable custom prompts — your notebook `/commands` |
 | `cmd.add(name, tmpl)` | Save your own command; **persists across sessions** |
 | `anki(focus="")` | Export the session to an **Anki-importable** `.txt` |
+| `upload_pdf()` | **Upload-PDF button** → expands the *whole* PDF into a new reader notebook (text as markdown cells, images embedded inline) with `solveit` ready, so you read it and chat beneath each section |
+| `read_pdf("f.pdf")` | Same, from a file path |
 | `tutor.recap()` | Session summary — what you covered & what to try next |
 
 Everything **streams live** into the notebook and **degrades gracefully** to
@@ -124,6 +129,16 @@ memory device, and it renders inline with the mnemonic caption. Auto-detects the
 image backend — **Gemini "nano banana pro"** (`gemini-3-pro-image-preview`, needs
 `pip install google-genai` + `GOOGLE_API_KEY`) or **OpenAI** (`gpt-image-2`, needs
 `OPENAI_API_KEY`). Force one with `configure_images(backend="gemini")`.
+
+**Read a whole PDF as a notebook** — upload it and `solveit` writes a new `<name>-reader.ipynb` where every section of the PDF is a markdown cell (images embedded inline so they render on open) with a conversation cell beneath it:
+
+```python
+upload_pdf()                 # Upload button → writes & points you to the reader notebook
+# or from a path:
+read_pdf("paper.pdf")        # docling for fidelity if installed, else pymupdf
+```
+
+The generated notebook already has `from solveit import *`, so under any section you can `tutor.ask("explain this")` — the document and your dialogue live in one place. Needs `pip install docling` (best quality) or `pip install pymupdf` (lighter).
 
 **Reusable prompts, discoverable with TAB** (like `/commands`):
 

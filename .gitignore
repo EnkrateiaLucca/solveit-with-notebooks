@@ -8,6 +8,7 @@ solveit_commands.json
 anki_exports/
 artifacts/
 images/
+*-reader.ipynb
 
 # Env / secrets
 .env

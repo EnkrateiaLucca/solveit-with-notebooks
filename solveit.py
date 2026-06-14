@@ -30,8 +30,10 @@ import sys
 import re
 import csv
 import json
+import base64
 import string as _string
 import datetime
+import tempfile
 import textwrap
 
 # ----------------------------------------------------------------------------
@@ -1271,6 +1273,230 @@ def _strip_fences(text: str) -> str:
 
 
 # ----------------------------------------------------------------------------
+# 11) upload_pdf / read_pdf — expand a PDF into a NEW reader notebook of cells.
+#
+# Design (see research-pdf-upload-jupyter.md): the only portable way to get a
+# whole PDF as real markdown cells is to WRITE A NEW .ipynb with nbformat and
+# open it. Images are embedded as base64 data-URIs INSIDE markdown cells, so
+# they render the moment the notebook opens (no file-serving, no "run me",
+# no broken `![](path)` links). Parsing prefers **docling** for fidelity
+# (great tables/figures) and falls back to **PyMuPDF** when docling is absent.
+# ----------------------------------------------------------------------------
+_PDF_PAGEBREAK = "<!--SOLVEIT-PAGEBREAK-->"
+
+
+def _slugify(name: str) -> str:
+    base = os.path.splitext(os.path.basename(name))[0]
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", base).strip("-").lower() or "pdf"
+
+
+def _img_to_datauri(data: bytes, ext: str = "png") -> str:
+    ext = "jpeg" if ext.lower() in ("jpg", "jpeg") else ext.lower()
+    return f"data:image/{ext};base64," + base64.b64encode(data).decode()
+
+
+def _pdf_markdown_docling(pdf_path: str) -> str:
+    """High-fidelity PDF -> markdown with base64-embedded images (docling)."""
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling_core.types.doc import ImageRefMode
+
+    opts = PdfPipelineOptions()
+    opts.generate_picture_images = True
+    opts.images_scale = 2.0
+    conv = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
+    res = conv.convert(pdf_path)
+    return res.document.export_to_markdown(
+        image_mode=ImageRefMode.EMBEDDED, page_break_placeholder=_PDF_PAGEBREAK)
+
+
+def _pdf_markdown_fitz(pdf_path: str) -> str:
+    """Lightweight PDF -> markdown: per-page text + base64-embedded images."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        try:
+            import fitz
+        except ImportError:
+            raise ImportError("pip install docling  (or pymupdf)")
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i, page in enumerate(doc, 1):
+        parts = [f"## Page {i}"]
+        text = page.get_text("text").strip()
+        if text:
+            parts.append(text)
+        for info in page.get_images(full=True):
+            try:
+                ext = doc.extract_image(info[0])
+            except Exception:
+                continue
+            uri = _img_to_datauri(ext["image"], ext.get("ext", "png"))
+            parts.append(f"![figure]({uri})")
+        pages.append("\n\n".join(parts))
+    doc.close()
+    return f"\n\n{_PDF_PAGEBREAK}\n\n".join(pages)
+
+
+def _pdf_to_markdown(pdf_path: str, backend: str = "auto") -> tuple[str, str]:
+    """Return (markdown, backend_used). 'auto' prefers docling, falls back to fitz."""
+    order = {"auto": ["docling", "fitz"], "docling": ["docling"],
+             "fitz": ["fitz"], "pymupdf": ["fitz"]}.get(backend, ["docling", "fitz"])
+    last_err = None
+    for b in order:
+        try:
+            if b == "docling":
+                return _pdf_markdown_docling(pdf_path), "docling"
+            return _pdf_markdown_fitz(pdf_path), "fitz"
+        except ImportError as e:
+            last_err = e
+            continue
+    raise last_err or ImportError("pip install docling")
+
+
+def _split_markdown_sections(md: str) -> list[str]:
+    """Split markdown into reading sections: by heading, else by page, else by size."""
+    md = md.replace(_PDF_PAGEBREAK, "").strip()
+    # Primary: start a new section at each markdown heading line.
+    sections, cur = [], []
+    for line in md.splitlines():
+        if re.match(r"^#{1,6}\s", line) and cur:
+            sections.append("\n".join(cur).strip())
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        sections.append("\n".join(cur).strip())
+    sections = [s for s in sections if s]
+    if len(sections) > 1:
+        return sections
+    # Fallback: no headings — group paragraphs (never split a data-URI, which is
+    # a single line) into chunks of a few blocks each.
+    blocks = [b for b in md.split("\n\n") if b.strip()]
+    chunk, out = [], []
+    for b in blocks:
+        chunk.append(b)
+        if len(chunk) >= 6:
+            out.append("\n\n".join(chunk))
+            chunk = []
+    if chunk:
+        out.append("\n\n".join(chunk))
+    return out or [md]
+
+
+def pdf_to_notebook(pdf_path: str, out_path: str | None = None, *,
+                    backend: str = "auto", setup: bool = True,
+                    conversation_cells: bool = True, name: str | None = None) -> str:
+    """Expand a PDF into a NEW notebook of cells and return its path.
+
+    Each section of the PDF becomes a **markdown cell** (images embedded inline
+    as base64, so they show on open), with a conversation **code cell** after it
+    that already has `solveit` imported — chat about the section right there.
+
+        pdf_to_notebook("paper.pdf")                  # docling if available, else pymupdf
+        pdf_to_notebook("paper.pdf", backend="fitz")  # force the fast/light parser
+    """
+    import nbformat as nbf
+    name = name or os.path.basename(pdf_path)
+    md_text, used = _pdf_to_markdown(pdf_path, backend)
+    sections = _split_markdown_sections(md_text)
+
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    cells = [nbf.v4.new_markdown_cell(
+        f"# 📄 {name}\n\n*Imported with `solveit` (parsed by **{used}**). The whole "
+        "document is below as cells — read each section and use the code cell "
+        "under it to discuss it with your tutor.*")]
+    if setup:
+        cells.append(nbf.v4.new_code_cell(
+            f"import sys; sys.path.append({pkg_dir!r})\nfrom solveit import *"))
+    for sec in sections:
+        cells.append(nbf.v4.new_markdown_cell(sec))
+        if conversation_cells:
+            cells.append(nbf.v4.new_code_cell(
+                "# 💬 Discuss this section — write your own, or uncomment:\n"
+                '# tutor.ask("Explain this section simply")'))
+
+    out_path = out_path or os.path.join(os.getcwd(), f"{_slugify(name)}-reader.ipynb")
+    nbf.write(nbf.v4.new_notebook(cells=cells), out_path)
+    _log("expanded a PDF into a notebook", f"{name} ({len(sections)} sections, {used})")
+
+    base = os.getcwd()
+    if _IN_NB:
+        rel = os.path.relpath(out_path, base)
+        href = rel if not os.path.isabs(rel) else out_path
+        html("<div style='font-family:system-ui,sans-serif;background:#e6f4ea;"
+             "border-left:4px solid #1a7f37;padding:10px 14px;border-radius:8px'>"
+             f"📄 <b>{_html_escape(name)}</b> → <b>{len(sections)}</b> sections, parsed "
+             f"by <b>{used}</b>.<br>Open <a href='{_html_escape(href)}' target='_blank'>"
+             f"<code>{_html_escape(os.path.basename(out_path))}</code></a> "
+             "(or use the file browser on the left) and read away.</div>")
+    else:
+        md(f"**Wrote reader notebook:** `{out_path}`  ·  {len(sections)} sections "
+           f"· parsed by {used}")
+    return out_path
+
+
+def read_pdf(pdf_path: str, *, backend: str = "auto") -> str:
+    """Expand a PDF *from a path* into a reader notebook (see `pdf_to_notebook`)."""
+    if not os.path.exists(pdf_path):
+        md(f"*No such file:* `{pdf_path}`")
+        return None
+    return pdf_to_notebook(pdf_path, backend=backend)
+
+
+def upload_pdf(*, backend: str = "auto"):
+    """Show an **Upload PDF** button; the dropped file is expanded into a notebook.
+
+    The new notebook contains the WHOLE PDF as cells (text as markdown, images
+    embedded inline) plus a `from solveit import *` setup cell, so you can read
+    it and talk to your `tutor` beneath each section. Parsing prefers **docling**
+    for fidelity and falls back to **PyMuPDF**.
+    """
+    if not _IN_NB:
+        md("*`upload_pdf()` needs Jupyter — use `read_pdf('file.pdf')` instead.*")
+        return
+    import ipywidgets as W
+    up = W.FileUpload(accept=".pdf", multiple=False, description="📄 Upload PDF",
+                      layout=W.Layout(width="220px"))
+    out = W.Output()
+
+    def on_change(change):
+        files = change["new"]
+        if not files:
+            return
+        item = files[0] if isinstance(files, (list, tuple)) else \
+            list(files.values())[0]
+        fname = item["name"]
+        content = item["content"]
+        content = content.tobytes() if hasattr(content, "tobytes") else bytes(content)
+        with out:
+            out.clear_output()
+            display(Markdown(f"⏳ *Parsing **{_html_escape(fname)}**… "
+                             "(docling's first run downloads models — give it a moment)*"))
+            tmp = os.path.join(tempfile.gettempdir(), fname)
+            with open(tmp, "wb") as f:
+                f.write(content)
+            try:
+                path = pdf_to_notebook(tmp, backend=backend, name=fname)
+            except ImportError:
+                out.clear_output()
+                display(Markdown("*PDF support needs `pip install docling` "
+                                 "(or `pip install pymupdf`).*"))
+                return
+            except Exception as e:
+                out.clear_output()
+                display(Markdown(f"*Couldn't parse the PDF ({type(e).__name__}: {e}).*"))
+                return
+            out.clear_output()
+            display(Markdown(f"✅ Done — opened **`{os.path.basename(path)}`** below."))
+
+    up.observe(on_change, names="value")
+    display(W.VBox([up, out]))
+
+
+# ----------------------------------------------------------------------------
 # Banner
 # ----------------------------------------------------------------------------
 __all__ = [
@@ -1278,6 +1504,7 @@ __all__ = [
     "explain", "explain_with_artifacts", "generate_visual_analogy",
     "explain_error", "hint", "quiz", "Quiz", "review",
     "propose", "edit", "recap", "anki", "cmd", "Commands",
+    "upload_pdf", "read_pdf", "pdf_to_notebook",
     "session_log", "configure", "configure_images", "md", "html",
     "help_solveit",
 ]
@@ -1305,6 +1532,8 @@ def help_solveit():
     | `cmd.<TAB>` | reusable custom prompts (`/commands`) — `cmd.eli5("loops")` |
     | `cmd.add(name, tmpl)` | save your own command (persists across sessions) |
     | `anki(focus="")` | export session to an **Anki**-importable `.txt` |
+    | `upload_pdf()` | **Upload-PDF button** → expands the whole PDF into a new reader notebook (cells + images), parsed by docling/pymupdf |
+    | `read_pdf("f.pdf")` | same, from a file path |
     | `tutor.recap()` | **session summary** — what you covered & what to try next |
 
     *The human is the agent: the AI proposes, **you** read, edit, and run.*
