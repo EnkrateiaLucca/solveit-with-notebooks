@@ -7,6 +7,7 @@ __pycache__/
 solveit_commands.json
 anki_exports/
 artifacts/
+images/
 
 # Env / secrets
 .env

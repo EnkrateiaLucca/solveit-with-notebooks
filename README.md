@@ -68,6 +68,7 @@ Override the model anytime: `configure(model="gpt-5")` or env `SOLVEIT_MODEL`.
 | `solve("problem")` | A **Pólya** session → `.understand() .plan() .step() .review()` |
 | `explain(x)` | Explain a value, object, or snippet at beginner level |
 | `explain_with_artifacts(x)` | Explain **+ a live interactive HTML artifact** embedded inline (sliders, steppers, visuals) |
+| `generate_visual_analogy("concept")` | AI-drawn **visual mnemonic** — a minimal image that encodes an idea, shown inline |
 | `explain_error()` | Explain the **last exception** — run it after a failing cell |
 | `hint("...")` | A **Socratic** nudge — never the full answer |
 | `quiz("topic")` | **Interactive** quiz: type answers in boxes → AI-graded, color-coded feedback |
@@ -110,6 +111,19 @@ explain_with_artifacts([10, 20, 30])                    # click to see indexing
 
 The AI builds a small self-contained HTML widget (sliders, buttons, visuals) and
 embeds it inline in a sandboxed iframe — no copy-pasting, no external setup.
+
+**Remember it with a picture** — turn a concept into a minimal visual mnemonic:
+
+```python
+generate_visual_analogy("Python list indexing starts at 0")
+generate_visual_analogy("a dictionary maps keys to values", aspect="16:9")
+```
+
+The AI invents a single striking metaphor, an image model draws it as a clean
+memory device, and it renders inline with the mnemonic caption. Auto-detects the
+image backend — **Gemini "nano banana pro"** (`gemini-3-pro-image-preview`, needs
+`pip install google-genai` + `GOOGLE_API_KEY`) or **OpenAI** (`gpt-image-2`, needs
+`OPENAI_API_KEY`). Force one with `configure_images(backend="gemini")`.
 
 **Reusable prompts, discoverable with TAB** (like `/commands`):
 

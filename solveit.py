@@ -93,6 +93,16 @@ _DEFAULTS = {
     "openai": "gpt-5-mini",
 }
 
+# Image generation is its own backend (text and images can use different vendors).
+_IMG_CFG = {
+    "backend": os.environ.get("SOLVEIT_IMAGE_BACKEND"),   # "gemini" | "openai"
+    "model": os.environ.get("SOLVEIT_IMAGE_MODEL"),
+}
+_IMG_DEFAULTS = {
+    "gemini": "gemini-3-pro-image-preview",   # "nano banana pro"
+    "openai": "gpt-image-2",
+}
+
 # A breadcrumb trail of what the learner did this session, so `recap()` can
 # summarize the WHOLE session — not just the turns that went through `tutor`.
 _SESSION_LOG: list[dict] = []
@@ -503,6 +513,186 @@ def explain_with_artifacts(thing, *, level: str = "beginner",
         md("*(No interactive artifact this time — here's the explanation above.)*")
     _log("explained with an interactive artifact", str(thing))
     return explanation
+
+
+# ----------------------------------------------------------------------------
+# 4b) generate_visual_analogy — an AI-drawn visual mnemonic, shown inline
+# ----------------------------------------------------------------------------
+_VISUAL_DESIGN_SYSTEM = textwrap.dedent("""
+    You design VISUAL MNEMONICS for a learner. Given a concept, invent ONE simple,
+    concrete, slightly exaggerated visual metaphor that encodes the core idea so it
+    sticks in memory (think: a single striking image you'd never forget).
+    The scene must be drawable and uncluttered — ONE focal metaphor, not a collage,
+    and NO text/letters/labels in the picture.
+""").strip()
+
+# A house style that keeps every analogy minimal and memorable.
+_VISUAL_STYLE = (
+    "Minimal flat vector illustration. A SINGLE bold iconic visual metaphor, "
+    "centered, with lots of negative space. Limited palette of 2-3 colors on a "
+    "warm cream (#F5F3EB) background, thick clean black linework, no gradients, "
+    "no 3D, no photorealism, and absolutely NO text, letters, numbers or labels. "
+    "Slightly playful and exaggerated so it is instantly memorable.")
+
+
+def _detect_image_backend() -> str:
+    if _IMG_CFG["backend"]:
+        return _IMG_CFG["backend"]
+    have_gemini = bool(os.environ.get("GOOGLE_API_KEY")
+                       or os.environ.get("GEMINI_API_KEY"))
+    have_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    # Prefer a vendor whose SDK is actually importable (better first-run UX).
+    if have_gemini and _can_import("google.genai"):
+        return "gemini"
+    if have_openai and _can_import("openai"):
+        return "openai"
+    return "gemini" if have_gemini else "openai"
+
+
+def _can_import(mod: str) -> bool:
+    import importlib.util
+    return importlib.util.find_spec(mod) is not None
+
+
+def configure_images(backend: str | None = None, model: str | None = None):
+    """Pick the image backend/model. e.g. configure_images(backend='gemini')."""
+    if backend is not None:
+        _IMG_CFG["backend"] = backend
+    if model is not None:
+        _IMG_CFG["model"] = model
+    b = _detect_image_backend()
+    md(f"**images configured** · backend=`{b}` · "
+       f"model=`{_IMG_CFG['model'] or _IMG_DEFAULTS[b]}`")
+
+
+def _gen_image_gemini(prompt: str, aspect: str, model: str, path: str):
+    from google import genai
+    from google.genai import types
+    client = genai.Client()   # reads GOOGLE_API_KEY / GEMINI_API_KEY
+    resp = client.models.generate_content(
+        model=model, contents=prompt,
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE", "TEXT"],
+            image_config=types.ImageConfig(aspect_ratio=aspect)))
+    parts = [p for p in resp.candidates[0].content.parts
+             if getattr(p, "inline_data", None)]
+    if not parts:
+        raise RuntimeError("Gemini returned no image (it may have refused the prompt).")
+    parts[0].as_image().save(path)
+
+
+# Map a friendly aspect ratio to the sizes gpt-image-* accepts.
+_OPENAI_SIZE = {"1:1": "1024x1024", "16:9": "1536x1024",
+                "9:16": "1024x1536", "4:5": "1024x1536"}
+
+
+def _gen_image_openai(prompt: str, aspect: str, model: str, path: str):
+    import base64
+    from openai import OpenAI
+    client = OpenAI()
+    resp = client.images.generate(
+        model=model, prompt=prompt, size=_OPENAI_SIZE.get(aspect, "1024x1024"), n=1)
+    datum = resp.data[0]
+    if getattr(datum, "b64_json", None):
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(datum.b64_json))
+    elif getattr(datum, "url", None):
+        import urllib.request
+        urllib.request.urlretrieve(datum.url, path)
+    else:
+        raise RuntimeError("OpenAI returned no image data.")
+
+
+def _render_visual_analogy(path: str, concept: str, analogy: str,
+                           mnemonic: str, width: int):
+    """Showcase the generated image + its mnemonic caption inline in the cell."""
+    html("<div style='font-family:system-ui,sans-serif;display:flex;gap:8px;"
+         "align-items:center;background:linear-gradient(135deg,#f5c542,#e86b5a);"
+         "color:#1a1a1a;padding:8px 14px;border-radius:10px;font-weight:700;"
+         f"font-size:14px;margin-top:6px'>🧠 Visual analogy · "
+         f"<span style='font-weight:500'>{_html_escape(concept)}</span></div>")
+    if _IN_NB:
+        from IPython.display import Image as _Img
+        display(_Img(filename=path, width=width))
+    cap = []
+    if analogy:
+        cap.append(f"<b>“{_html_escape(analogy)}”</b>")
+    if mnemonic:
+        cap.append(f"<span style='color:#374151'>{_html_escape(mnemonic)}</span>")
+    if cap:
+        html("<div style='font-family:system-ui,sans-serif;line-height:1.5;"
+             "border-left:4px solid #e86b5a;background:#fff8e1;padding:8px 14px;"
+             f"border-radius:8px;max-width:560px'>{'<br>'.join(cap)}</div>")
+    md(f"<sub>saved to <code>{path}</code></sub>")
+
+
+def generate_visual_analogy(concept: str, *, aspect: str = "1:1",
+                            width: int = 420, backend: str | None = None,
+                            model: str | None = None,
+                            filename: str | None = None) -> str:
+    """Draw a minimal *visual mnemonic* for a concept and show it inline.
+
+    The AI first invents a single striking visual metaphor for `concept`, then an
+    image model (Gemini "nano banana pro" or OpenAI `gpt-image-2`) draws it as a
+    clean, memorable picture rendered right in the notebook — a memory device for
+    whatever you're learning.
+
+        generate_visual_analogy("Python list indexing starts at 0")
+        generate_visual_analogy("a dictionary maps keys to values", aspect="16:9")
+
+    Returns the saved image path (or None if generation failed).
+    """
+    # 1) Design the mnemonic (text model) — metaphor, why-it-sticks, image prompt.
+    raw = ask(
+        f"Concept the learner is studying:\n\n{concept}\n\n"
+        'Return ONLY JSON: {"analogy": "<the metaphor in one vivid line>", '
+        '"mnemonic": "<1-2 sentences: how the picture maps to the concept so '
+        'recalling the image recalls the idea>", "image_prompt": "<a concrete, '
+        "literal description of the SINGLE minimal scene to draw — objects, "
+        'layout, colors; no text in the image>"}.',
+        system=_VISUAL_DESIGN_SYSTEM, render=False)
+    spec = _extract_json(raw) or {}
+    analogy = (spec.get("analogy") or "").strip()
+    mnemonic = (spec.get("mnemonic") or "").strip()
+    image_prompt = (spec.get("image_prompt") or analogy or concept).strip()
+
+    # 2) Render the image (image model).
+    b = backend or _detect_image_backend()
+    if model:
+        chosen_model = model
+    else:
+        chosen_model = _IMG_CFG["model"] or _IMG_DEFAULTS.get(b, "")
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = filename or f"analogy-{stamp}.png"
+    if not filename.endswith(".png"):
+        filename += ".png"
+    path = os.path.join(out_dir, filename)
+
+    full_prompt = f"{image_prompt}\n\nStyle: {_VISUAL_STYLE}"
+    if _IN_NB:
+        md(f"🎨 *Drawing a visual analogy with `{b}` (`{chosen_model}`)…*")
+    try:
+        if b == "gemini":
+            _gen_image_gemini(full_prompt, aspect, chosen_model, path)
+        elif b == "openai":
+            _gen_image_openai(full_prompt, aspect, chosen_model, path)
+        else:
+            raise RuntimeError(f"Unknown image backend: {b!r}")
+    except ImportError:
+        pkg = "google-genai" if b == "gemini" else "openai"
+        md(f"*Image backend `{b}` needs `pip install {pkg}` "
+           "(or `configure_images(backend=...)`).*")
+        return None
+    except Exception as e:
+        md(f"*Couldn't generate the image ({type(e).__name__}: {e}). "
+           "Try again or `configure_images(backend=...)`.*")
+        return None
+
+    _render_visual_analogy(path, concept, analogy, mnemonic, width)
+    _log("made a visual analogy", concept)
+    return path
 
 
 def explain_error() -> str:
@@ -1085,10 +1275,11 @@ def _strip_fences(text: str) -> str:
 # ----------------------------------------------------------------------------
 __all__ = [
     "ask", "Dialogue", "tutor", "Polya", "solve",
-    "explain", "explain_with_artifacts", "explain_error", "hint",
-    "quiz", "Quiz", "review",
+    "explain", "explain_with_artifacts", "generate_visual_analogy",
+    "explain_error", "hint", "quiz", "Quiz", "review",
     "propose", "edit", "recap", "anki", "cmd", "Commands",
-    "session_log", "configure", "md", "html", "help_solveit",
+    "session_log", "configure", "configure_images", "md", "html",
+    "help_solveit",
 ]
 
 
@@ -1103,6 +1294,7 @@ def help_solveit():
     | `solve("problem")` | start a **Pólya** session → `.understand() .plan() .step() .review()` |
     | `explain(x)` | explain a value or snippet at beginner level |
     | `explain_with_artifacts(x)` | explain **+ an interactive HTML artifact** rendered inline |
+    | `generate_visual_analogy("concept")` | AI-drawn **visual mnemonic** image, shown inline (Gemini / `gpt-image-2`) |
     | `explain_error()` | explain the **last error** that occurred |
     | `hint("...")` | a **Socratic** nudge — never the full answer |
     | `quiz("topic")` | **interactive** quiz: type answers in boxes → AI-graded feedback |
