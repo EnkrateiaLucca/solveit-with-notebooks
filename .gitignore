@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local, user-specific session state (auto-created)
+solveit_commands.json
+anki_exports/
+
+# Env / secrets
+.env
+*.env
+
+# OS
+.DS_Store

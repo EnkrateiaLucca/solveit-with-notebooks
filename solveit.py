@@ -1,0 +1,1029 @@
+"""
+solveit.py — a tiny, teachable SolveIt-style toolkit for Jupyter notebooks.
+
+Inspired by Jeremy Howard's SolveIt (https://solve.it.com), which builds on
+George Pólya's "How to Solve It" (1945). The whole philosophy in four ideas:
+
+  1. DIALOGUE, not prompting   -> talk *with* the AI over many small turns.
+  2. PÓLYA's loop              -> Understand -> Plan -> Do (tiny steps) -> Review.
+  3. TINY STEPS + feedback     -> 1-2 lines, run it, look at the result, repeat.
+  4. THE HUMAN IS THE AGENT    -> the AI proposes; *you* read, edit, and run.
+
+This module gives you a handful of functions that make those four ideas the
+path of least resistance inside a normal notebook. Drop it next to your
+notebook and start a class with:
+
+    import sys; sys.path.append("..")     # if solveit.py is one level up
+    from solveit import *
+
+Then use `ask(...)`, `tutor.ask(...)`, `hint(...)`, `explain(...)`,
+`explain_error()`, `propose(...)`, `quiz(...)`, `review(...)`.
+
+Backend: auto-detects ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY (GPT).
+Override anything with `configure(model=..., backend=...)` or env vars
+SOLVEIT_MODEL / SOLVEIT_BACKEND.
+"""
+
+from __future__ import annotations
+import os
+import sys
+import csv
+import json
+import string as _string
+import datetime
+import textwrap
+
+# ----------------------------------------------------------------------------
+# Rendering helpers (degrade gracefully outside Jupyter)
+# ----------------------------------------------------------------------------
+try:
+    from IPython.display import Markdown, HTML, display, update_display
+    from IPython import get_ipython
+    _IN_NB = get_ipython() is not None
+except Exception:  # pragma: no cover - not in IPython
+    _IN_NB = False
+
+    def display(*a, **k):
+        print(*a)
+
+    def update_display(*a, **k):
+        pass
+
+    class Markdown(str):  # type: ignore
+        def __init__(self, x): self.data = x
+
+    class HTML(str):  # type: ignore
+        def __init__(self, x): self.data = x
+
+    def get_ipython():
+        return None
+
+
+def md(text: str):
+    """Render `text` as Markdown in the notebook (plain print elsewhere)."""
+    if _IN_NB:
+        display(Markdown(text))
+    else:
+        print(text)
+    return None
+
+
+def html(markup: str):
+    """Render raw HTML in the notebook (plain print elsewhere)."""
+    if _IN_NB:
+        display(HTML(markup))
+    else:
+        print(markup)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------
+_CFG = {
+    "backend": os.environ.get("SOLVEIT_BACKEND"),   # "anthropic" | "openai"
+    "model": os.environ.get("SOLVEIT_MODEL"),       # e.g. "claude-sonnet-4-5"
+    "max_tokens": 4096,
+    "stream": True,
+}
+
+_DEFAULTS = {
+    "anthropic": "claude-sonnet-4-5",
+    "openai": "gpt-5-mini",
+}
+
+# A breadcrumb trail of what the learner did this session, so `recap()` can
+# summarize the WHOLE session — not just the turns that went through `tutor`.
+_SESSION_LOG: list[dict] = []
+
+
+def _log(action: str, detail: str = ""):
+    detail = (detail or "").strip().replace("\n", " ")
+    if len(detail) > 140:
+        detail = detail[:137] + "…"
+    _SESSION_LOG.append({"action": action, "detail": detail})
+
+
+def session_log():
+    """Return the raw list of this session's logged actions."""
+    return list(_SESSION_LOG)
+
+
+def _detect_backend() -> str:
+    if _CFG["backend"]:
+        return _CFG["backend"]
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai"
+    # default guess; will raise a friendly error at call time if no key
+    return "anthropic"
+
+
+def configure(backend: str | None = None, model: str | None = None,
+              max_tokens: int | None = None, stream: bool | None = None):
+    """Override defaults for the session. e.g. configure(model='gpt-5')."""
+    if backend is not None:
+        _CFG["backend"] = backend
+    if model is not None:
+        _CFG["model"] = model
+    if max_tokens is not None:
+        _CFG["max_tokens"] = max_tokens
+    if stream is not None:
+        _CFG["stream"] = stream
+    b = _detect_backend()
+    md(f"**solveit configured** · backend=`{b}` · model=`{_CFG['model'] or _DEFAULTS[b]}`")
+
+
+# ----------------------------------------------------------------------------
+# LLM backends — streaming generators of text chunks
+# ----------------------------------------------------------------------------
+def _model_for(backend: str) -> str:
+    return _CFG["model"] or _DEFAULTS[backend]
+
+
+def _stream_chunks(messages, system):
+    """Yield text chunks from whichever backend is active."""
+    backend = _detect_backend()
+    model = _model_for(backend)
+
+    if backend == "anthropic":
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError("pip install anthropic  (or configure(backend='openai'))")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("Set ANTHROPIC_API_KEY (or configure(backend='openai')).")
+        client = anthropic.Anthropic()
+        with client.messages.stream(
+            model=model,
+            system=system or "You are a helpful assistant.",
+            messages=messages,
+            max_tokens=_CFG["max_tokens"],
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+
+    elif backend == "openai":
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError("pip install openai  (or configure(backend='anthropic'))")
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise RuntimeError("Set OPENAI_API_KEY (or configure(backend='anthropic')).")
+        client = OpenAI()
+        msgs = ([{"role": "system", "content": system}] if system else []) + messages
+        resp = client.chat.completions.create(model=model, messages=msgs, stream=True)
+        for chunk in resp:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    else:
+        raise RuntimeError(f"Unknown backend: {backend!r}")
+
+
+def _run(messages, system=None, stream=None, render=True) -> str:
+    """Core call. Streams into the notebook live and returns the full text."""
+    stream = _CFG["stream"] if stream is None else stream
+    acc = ""
+
+    if render and _IN_NB and stream:
+        handle = display(Markdown("▌"), display_id=True)
+        for chunk in _stream_chunks(messages, system):
+            acc += chunk
+            handle.update(Markdown(acc + " ▌"))
+        handle.update(Markdown(acc))
+    else:
+        for chunk in _stream_chunks(messages, system):
+            acc += chunk
+        if render:
+            md(acc)
+    return acc
+
+
+# ----------------------------------------------------------------------------
+# 1) ask — one-shot question, pretty-rendered
+# ----------------------------------------------------------------------------
+def ask(prompt: str, *, system: str | None = None, render: bool = True,
+        stream: bool | None = None, _loggable: bool = True):
+    """Ask the AI a single question. Renders Markdown in the notebook.
+
+    Returns None when it has already rendered into the notebook (so Jupyter
+    doesn't also echo the raw string). Pass `render=False` to get the text back.
+
+    >>> ask("In one sentence, what is a Python list?")   # renders, returns None
+    >>> txt = ask("...", render=False)                    # returns the string
+    """
+    out = _run([{"role": "user", "content": prompt}], system=system,
+               stream=stream, render=render)
+    if render and _loggable:
+        _log("asked a question", prompt)
+    return None if (render and _IN_NB) else out
+
+
+# ----------------------------------------------------------------------------
+# 2) Dialogue — persistent conversation (this is "dialogue engineering")
+# ----------------------------------------------------------------------------
+class Dialogue:
+    """A running conversation that remembers prior turns.
+
+    The whole point of SolveIt: don't fire one-shot prompts, hold a
+    *dialogue*. Each `.ask()` appends to history so the AI keeps context.
+
+        chat = Dialogue(system="You are a patient Python tutor.")
+        chat.ask("What's a dictionary?")
+        chat.ask("Show me a tiny example.")   # remembers the previous turn
+    """
+
+    def __init__(self, system: str | None = None, name: str = "dialogue"):
+        self.system = system
+        self.name = name
+        self.history: list[dict] = []
+
+    def ask(self, prompt: str, *, render: bool = True,
+            stream: bool | None = None):
+        self.history.append({"role": "user", "content": prompt})
+        out = _run(self.history, system=self.system, stream=stream, render=render)
+        self.history.append({"role": "assistant", "content": out})
+        # Don't echo the raw string when we've already rendered it in the notebook.
+        return None if (render and _IN_NB) else out
+
+    def reset(self):
+        """Forget the conversation, keep the system prompt."""
+        self.history = []
+        md(f"*{self.name} reset.*")
+
+    def show(self):
+        """Print the conversation so far (useful for review / export)."""
+        lines = []
+        for m in self.history:
+            who = "🧑 You" if m["role"] == "user" else "🤖 AI"
+            lines.append(f"**{who}:**\n\n{m['content']}")
+        md("\n\n---\n\n".join(lines) or "*empty dialogue*")
+
+    def _condensed_history(self, limit: int = 16) -> str:
+        recent = self.history[-limit:]
+        out = []
+        for m in recent:
+            who = "Student" if m["role"] == "user" else "Tutor"
+            text = m["content"].strip().replace("\n", " ")
+            if len(text) > 220:
+                text = text[:217] + "…"
+            out.append(f"{who}: {text}")
+        return "\n".join(out)
+
+    def recap(self, *, render: bool = True, stream: bool | None = None):
+        """Summarize the whole learning session: what was covered & what's next.
+
+        Use this as the closing "look back" of a SolveIt session:
+
+            tutor.recap()   # a warm, structured summary of everything you did
+        """
+        breadcrumbs = "\n".join(
+            f"- {e['action']}" + (f": {e['detail']}" if e['detail'] else "")
+            for e in _SESSION_LOG) or "(no actions logged)"
+        convo = self._condensed_history() or "(no tutor dialogue)"
+        if not _SESSION_LOG and not self.history:
+            md("*Nothing to recap yet — do some learning first, then call "
+               "`tutor.recap()`.*")
+            return None
+
+        prompt = (
+            "Below is a record of a beginner's Python learning session. Write a "
+            "warm, concise session recap addressed to the student ('you'). Use "
+            "these markdown sections, and keep each tight:\n\n"
+            "## 📚 What we covered\n"
+            "## 💡 Key takeaways\n(3-6 bullets of concrete concepts/skills)\n"
+            "## 🛠️ What you practiced\n"
+            "## 🎯 Suggested next steps\n(2-3 specific things to try next)\n"
+            "## 🌟 Nice work\n(one encouraging sentence)\n\n"
+            "Base it ONLY on what actually happened below; don't invent topics.\n\n"
+            f"=== ACTIONS THIS SESSION ===\n{breadcrumbs}\n\n"
+            f"=== TUTOR DIALOGUE (recent) ===\n{convo}")
+
+        if render and _IN_NB:
+            html("<div style='background:linear-gradient(135deg,#0ea5e9,#6366f1);"
+                 "color:white;padding:12px 18px;border-radius:12px;"
+                 "font-family:system-ui,sans-serif;font-size:17px;font-weight:700'>"
+                 "🎓 Session Recap</div>")
+        out = _run([{"role": "user", "content": prompt}],
+                   system=self.system, stream=stream, render=render)
+        self.history.append({"role": "user", "content":
+                             "(generated a session recap)"})
+        self.history.append({"role": "assistant", "content": out})
+        return None if (render and _IN_NB) else out
+
+
+# A default tutor dialogue, ready to use out of the box.
+_TUTOR_SYSTEM = textwrap.dedent("""
+    You are a patient, encouraging Python tutor for a complete beginner.
+    Rules:
+    - Keep answers short and concrete. Prefer a tiny runnable example over prose.
+    - Build understanding in small steps; never dump a huge solution.
+    - When you show code, keep it to a few lines and explain each line plainly.
+    - Use everyday analogies. Avoid jargon, or define it immediately.
+    - End with one small question or next step to keep the dialogue going.
+""").strip()
+
+tutor = Dialogue(system=_TUTOR_SYSTEM, name="tutor")
+
+
+# ----------------------------------------------------------------------------
+# 3) Pólya scaffolds — Understand -> Plan -> Do -> Review
+# ----------------------------------------------------------------------------
+_POLYA_SYSTEM = textwrap.dedent("""
+    You are a problem-solving coach using George Pólya's "How to Solve It".
+    You help a beginner programmer think, you do NOT solve everything for them.
+    Keep every reply short and focused on the current Pólya stage only.
+""").strip()
+
+
+class Polya:
+    """A guided Pólya session over a single problem, as a dialogue.
+
+        p = Polya("Count how many words are in a sentence")
+        p.understand()   # restate the problem, surface unknowns
+        p.plan()         # propose a step-by-step plan in plain words
+        p.step()         # suggest the *smallest next* line of code to try
+        p.review()       # reflect once you have something working
+    """
+
+    def __init__(self, problem: str):
+        self.problem = problem
+        self.chat = Dialogue(system=_POLYA_SYSTEM, name="polya")
+        _log("started a Pólya problem-solving session", problem)
+        md(f"### 🧩 Problem\n{problem}\n\n*Use `.understand()`, `.plan()`, "
+           f"`.step()`, `.review()` to work through it.*")
+
+    def understand(self):
+        md("#### 1 · Understand the problem")
+        return self.chat.ask(
+            f"PROBLEM: {self.problem}\n\nStage 1 — UNDERSTAND. Restate the problem "
+            "in plain language. List the inputs, the desired output, and any "
+            "unknowns or assumptions. Ask me 1-2 clarifying questions. No code yet.")
+
+    def plan(self):
+        md("#### 2 · Devise a plan")
+        return self.chat.ask(
+            "Stage 2 — PLAN. Give a short numbered plan in plain English (no code). "
+            "Each step should be tiny enough to become 1-2 lines of Python.")
+
+    def step(self, note: str = ""):
+        md("#### 3 · Carry it out (one tiny step)")
+        extra = f" Here's where I am: {note}" if note else ""
+        return self.chat.ask(
+            "Stage 3 — DO. Suggest only the SINGLE smallest next step. Show at most "
+            "1-3 lines of code for that step and tell me what to look for when I run "
+            f"it. Wait for me before going further.{extra}")
+
+    def review(self, note: str = ""):
+        md("#### 4 · Look back")
+        extra = f" My current solution / result: {note}" if note else ""
+        return self.chat.ask(
+            "Stage 4 — REVIEW. Help me look back: is the result correct? What edge "
+            "cases might break it? How could it be simpler or clearer? "
+            f"What did I learn that transfers to other problems?{extra}")
+
+
+def solve(problem: str) -> Polya:
+    """Start a Pólya session. `p = solve("..."); p.understand()`."""
+    return Polya(problem)
+
+
+# ----------------------------------------------------------------------------
+# 4) Teaching helpers
+# ----------------------------------------------------------------------------
+def explain(thing, *, level: str = "beginner") -> str:
+    """Explain a value, an object, or a snippet of code in plain language.
+
+    >>> explain([1, 2, 3])
+    >>> explain("for i in range(3): print(i)")
+    """
+    if isinstance(thing, str) and ("\n" in thing or any(
+            k in thing for k in ("def ", "import ", "=", "(", "print"))):
+        body = f"this Python code:\n\n```python\n{thing}\n```"
+    else:
+        body = f"this Python value: `{thing!r}` (type: {type(thing).__name__})"
+    res = ask(f"Explain {body}\n\nKeep it to a {level} level: a few short "
+              "sentences, one tiny analogy, no fluff.",
+              system=_TUTOR_SYSTEM, _loggable=False)
+    _log("explored a concept", str(thing))
+    return res
+
+
+def explain_error() -> str:
+    """Explain the LAST exception that happened, in beginner terms.
+
+    Run this in a fresh cell right after a cell raised an error.
+    """
+    exc = getattr(sys, "last_value", None)
+    tb_type = getattr(sys, "last_type", None)
+    if exc is None:
+        md("*No recent error found. Run the failing cell first, then call "
+           "`explain_error()` in the next cell.*")
+        return None
+    name = tb_type.__name__ if tb_type else type(exc).__name__
+    res = ask(
+        f"A beginner hit this Python error:\n\n{name}: {exc}\n\n"
+        "1) Explain in plain English what it means. "
+        "2) List the most likely causes. "
+        "3) Suggest how to fix it. Be concise and kind.",
+        system=_TUTOR_SYSTEM, _loggable=False)
+    _log("debugged an error", f"{name}: {exc}")
+    return res
+
+
+def hint(problem: str) -> str:
+    """Get a SOCRATIC hint — a nudge, never the full solution.
+
+    Keeps the human as the agent. Great for exercises.
+    """
+    res = ask(
+        f"I'm working on this and I'm stuck:\n\n{problem}\n\n"
+        "Give me ONE small Socratic hint that nudges my thinking. Do NOT give "
+        "the answer or write the solution code. Maybe ask me a guiding question.",
+        system=_TUTOR_SYSTEM, _loggable=False)
+    _log("asked for a hint", problem)
+    return res
+
+
+def _extract_json(text: str):
+    """Best-effort pull a JSON array/object out of an LLM reply."""
+    t = _strip_fences(text).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    # find the outermost [ ... ] or { ... }
+    for open_c, close_c in (("[", "]"), ("{", "}")):
+        i, j = t.find(open_c), t.rfind(close_c)
+        if i != -1 and j != -1 and j > i:
+            try:
+                return json.loads(t[i:j + 1])
+            except Exception:
+                continue
+    return None
+
+
+# Verdict -> (emoji, accent colour, soft background)
+_VERDICT_STYLE = {
+    "correct": ("✅", "#1a7f37", "#e6f4ea"),
+    "partial": ("🟡", "#9a6700", "#fff8e1"),
+    "incorrect": ("❌", "#c0392b", "#fdecea"),
+}
+
+
+class Quiz:
+    """An interactive, self-contained check-for-understanding.
+
+    Unlike a one-shot question, a Quiz *remembers* the questions it asked.
+    You type answers into boxes, hit one button, and the AI grades them with
+    full knowledge of both the questions AND your answers — no copy-pasting.
+
+        q = quiz("Python variables and f-strings", n=3)   # renders the quiz
+        # ...type answers in the boxes, click "Submit for feedback"...
+        tutor.ask("explain question 2 more")   # tutor already knows the quiz
+    """
+
+    def __init__(self, topic: str, n: int = 3):
+        self.topic = topic
+        self.questions = self._generate(n)
+        self.answers: list[str] = []
+        self.graded: list[dict] = []
+        self._boxes = []
+        _log("took a quiz on", topic)
+        if _IN_NB:
+            self._render_interactive()
+        else:  # headless fallback
+            for i, q in enumerate(self.questions, 1):
+                print(f"{i}. [{q.get('kind','')}] {q['question']}")
+
+    # -- generation ---------------------------------------------------------
+    def _generate(self, n: int) -> list[dict]:
+        raw = ask(
+            f"Create {n} short check-for-understanding questions about: {self.topic}. "
+            "Include a mix: one recall, one 'predict the output' (show a tiny code "
+            "snippet in the question), and one 'spot the bug'. "
+            'Return ONLY JSON: a list of objects like '
+            '[{"question": "...", "kind": "recall|predict|bug"}]. No answers.',
+            system=_TUTOR_SYSTEM, render=False)
+        data = _extract_json(raw) or []
+        out = []
+        for item in data:
+            if isinstance(item, dict) and item.get("question"):
+                out.append({"question": item["question"],
+                            "kind": item.get("kind", "")})
+            elif isinstance(item, str):
+                out.append({"question": item, "kind": ""})
+        return out or [{"question": raw, "kind": ""}]
+
+    # -- interactive UI -----------------------------------------------------
+    def _render_interactive(self):
+        import ipywidgets as W
+        header = W.HTML(
+            "<div style='background:linear-gradient(135deg,#6366f1,#8b5cf6);"
+            "color:white;padding:14px 18px;border-radius:12px;"
+            "font-family:system-ui,sans-serif'>"
+            f"<div style='font-size:18px;font-weight:700'>🧠 Quick Check</div>"
+            f"<div style='opacity:.9;font-size:13px;margin-top:2px'>{self.topic} "
+            "· answer in the boxes, then hit submit</div></div>")
+
+        cards = []
+        for i, q in enumerate(self.questions, 1):
+            kind = q["kind"]
+            tag = (f"<span style='background:#eef2ff;color:#4338ca;font-size:11px;"
+                   f"padding:1px 8px;border-radius:999px;margin-left:6px'>{kind}</span>"
+                   if kind else "")
+            qhtml = W.HTML(
+                "<div style='font-family:system-ui,sans-serif;margin-bottom:4px'>"
+                f"<span style='display:inline-block;width:24px;height:24px;"
+                "background:#6366f1;color:white;border-radius:50%;text-align:center;"
+                f"line-height:24px;font-weight:700;font-size:13px'>{i}</span>"
+                f"&nbsp;<b>{_html_escape(q['question'])}</b>{tag}</div>")
+            box = W.Textarea(placeholder="Type your answer here…",
+                             layout=W.Layout(width="98%", height="64px"))
+            self._boxes.append(box)
+            cards.append(W.VBox([qhtml, box], layout=W.Layout(
+                border="1px solid #e5e7eb", border_radius="10px",
+                padding="10px 12px", margin="8px 0")))
+
+        submit = W.Button(description="Submit for feedback", icon="check",
+                          button_style="success",
+                          layout=W.Layout(width="220px", height="38px"))
+        self._out = W.Output()
+        submit.on_click(self._on_submit)
+        display(W.VBox([header] + cards + [submit, self._out]))
+
+    def _on_submit(self, _btn):
+        import ipywidgets as W
+        self.answers = [b.value for b in self._boxes]
+        with self._out:
+            self._out.clear_output()
+            display(Markdown("⏳ *Grading your answers…*"))
+            self.grade()
+            self._out.clear_output()
+            self._render_feedback()
+
+    # -- grading (AI sees questions + answers together) ---------------------
+    def grade(self) -> list[dict]:
+        qa = "\n\n".join(
+            f"Q{i}. ({q['kind']}) {q['question']}\nStudent answer: "
+            f"{self.answers[i-1].strip() or '(left blank)'}"
+            for i, q in enumerate(self.questions, 1))
+        raw = ask(
+            "You are grading a beginner's quiz. For EACH question below, judge the "
+            "student's answer. Be encouraging but honest.\n\n" + qa + "\n\n"
+            'Return ONLY JSON: a list (same order) of objects like '
+            '[{"verdict": "correct|partial|incorrect", "feedback": "one or two '
+            'sentences addressed to the student", "ideal": "the correct answer, '
+            'briefly"}].',
+            system=_TUTOR_SYSTEM, render=False)
+        data = _extract_json(raw) or []
+        self.graded = data if isinstance(data, list) else []
+        score = sum(1 for g in self.graded if g.get("verdict") == "correct")
+        _log("scored on the quiz", f"{score}/{len(self.questions)} on {self.topic}")
+        self._remember()   # make the tutor aware of this quiz
+        return self.graded
+
+    def _render_feedback(self):
+        score = sum(1 for g in self.graded if g.get("verdict") == "correct")
+        total = len(self.questions)
+        pct = int(100 * score / total) if total else 0
+        bar = (f"<div style='background:#e5e7eb;border-radius:999px;height:10px;"
+               f"width:100%;overflow:hidden;margin-top:6px'>"
+               f"<div style='background:linear-gradient(90deg,#34d399,#10b981);"
+               f"height:10px;width:{pct}%'></div></div>")
+        parts = [
+            "<div style='font-family:system-ui,sans-serif'>"
+            f"<div style='font-size:17px;font-weight:700'>📊 You scored "
+            f"{score}/{total}" + ("  🎉" if score == total else "") + "</div>"
+            + bar + "</div>"]
+        for i, q in enumerate(self.questions, 1):
+            g = self.graded[i-1] if i-1 < len(self.graded) else {}
+            emoji, accent, bg = _VERDICT_STYLE.get(
+                g.get("verdict", "partial"), _VERDICT_STYLE["partial"])
+            ans = _html_escape(self.answers[i-1].strip() or "(blank)")
+            parts.append(
+                f"<div style='border-left:4px solid {accent};background:{bg};"
+                "padding:10px 14px;border-radius:8px;margin:8px 0;"
+                "font-family:system-ui,sans-serif;line-height:1.5'>"
+                f"<b>{emoji} Q{i}.</b> {_html_escape(q['question'])}<br>"
+                f"<span style='color:#374151'><i>Your answer:</i> {ans}</span><br>"
+                f"<span style='color:{accent}'><b>Feedback:</b> "
+                f"{_html_escape(g.get('feedback',''))}</span><br>"
+                f"<span style='color:#4b5563'><b>Ideal:</b> "
+                f"{_html_escape(g.get('ideal',''))}</span></div>")
+        html("".join(parts))
+        md("💬 *Want more detail? Ask `tutor.ask(\"explain question 2 more\")` — "
+           "it already knows this quiz.*")
+
+    def _remember(self):
+        """Push the quiz Q&A into the shared tutor dialogue so follow-ups work."""
+        lines = [f"We just did a quiz on '{self.topic}'. Here it is:"]
+        for i, q in enumerate(self.questions, 1):
+            ans = self.answers[i-1].strip() if i-1 < len(self.answers) else ""
+            lines.append(f"Q{i} ({q['kind']}): {q['question']}\n"
+                         f"My answer: {ans or '(blank)'}")
+        tutor.history.append({"role": "user", "content": "\n".join(lines)})
+        tutor.history.append({"role": "assistant", "content":
+            "Got it — I have all the quiz questions and your answers in mind. "
+            "Ask me about any of them."})
+
+
+def quiz(topic: str, n: int = 3) -> "Quiz":
+    """Start an interactive check-for-understanding. Returns a `Quiz`.
+
+    Type answers in the boxes, click submit, get color-coded feedback. The
+    grader sees your answers AND the questions, and the `tutor` remembers it.
+    """
+    return Quiz(topic, n)
+
+
+def _html_escape(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def recap(*, render: bool = True, stream: bool | None = None):
+    """Closing 'look back': summarize the whole session. Same as `tutor.recap()`."""
+    return tutor.recap(render=render, stream=stream)
+
+
+def _session_material(limit: int = 40) -> str:
+    """Stitch the session log + tutor dialogue into source material for the AI."""
+    parts = []
+    if _SESSION_LOG:
+        parts.append("Actions this session:\n" + "\n".join(
+            f"- {e['action']}" + (f": {e['detail']}" if e['detail'] else "")
+            for e in _SESSION_LOG))
+    if tutor.history:
+        parts.append("Tutor dialogue:\n" + tutor._condensed_history(limit=limit))
+    return "\n\n".join(parts)
+
+
+# ----------------------------------------------------------------------------
+# 8) anki — export the session (or a custom focus) to Anki-importable cards
+# ----------------------------------------------------------------------------
+def anki(focus: str = "", n: int = 12, filename: str | None = None):
+    """Generate Anki flashcards from the session and save an importable .txt.
+
+    The file is `front;back;source` per line (semicolon-separated, CSV-quoted),
+    ready for Anki's File → Import.
+
+        anki()                      # cards from everything you did this session
+        anki("f-strings and loops") # only those topics
+        anki(focus="just the errors I debugged", n=6)
+    """
+    material = _session_material()
+    if not material and not focus:
+        md("*Nothing to make cards from yet. Do some learning (or pass a "
+           "`focus=` topic), then call `anki(...)`.*")
+        return None
+
+    instr = (f"Focus ONLY on what the student asked for: {focus}.\n" if focus
+             else "Cover the key concepts and skills from this session.\n")
+    raw = ask(
+        f"Create {n} high-quality Anki flashcards for a Python beginner.\n{instr}"
+        "Rules: each card is ATOMIC (one idea), uses active recall, front is a "
+        "clear question/prompt, back is a concise answer (you may use a tiny code "
+        "snippet). Add a short 'source' tag naming the topic. Avoid duplicates.\n\n"
+        'Return ONLY JSON: a list like '
+        '[{"front":"...","back":"...","source":"..."}].\n\n'
+        f"=== SESSION MATERIAL ===\n{material or focus}",
+        system=_TUTOR_SYSTEM, render=False)
+    cards = _extract_json(raw) or []
+    cards = [c for c in cards if isinstance(c, dict) and c.get("front") and c.get("back")]
+    if not cards:
+        md("*Could not generate cards — try again or narrow the `focus`.*")
+        return None
+
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anki_exports")
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = filename or f"anki-{stamp}.txt"
+    if not filename.endswith(".txt"):
+        filename += ".txt"
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")          # auto-quotes fields with ; or \n
+        for c in cards:
+            w.writerow([c["front"].strip(), c["back"].strip(),
+                        str(c.get("source", "")).strip()])
+    _log("exported Anki cards", f"{len(cards)} cards" + (f" on {focus}" if focus else ""))
+
+    # preview
+    rows = "".join(
+        f"<tr><td style='padding:4px 10px;border-bottom:1px solid #eee'>"
+        f"{_html_escape(c['front'])}</td>"
+        f"<td style='padding:4px 10px;border-bottom:1px solid #eee'>"
+        f"{_html_escape(c['back'])}</td></tr>" for c in cards[:6])
+    html(
+        "<div style='font-family:system-ui,sans-serif'>"
+        "<div style='background:linear-gradient(135deg,#22c55e,#16a34a);color:white;"
+        "padding:10px 16px;border-radius:10px;font-weight:700'>"
+        f"🗂️ {len(cards)} Anki cards saved</div>"
+        "<table style='border-collapse:collapse;margin-top:8px;font-size:13px'>"
+        "<tr><th style='text-align:left;padding:4px 10px'>Front</th>"
+        "<th style='text-align:left;padding:4px 10px'>Back</th></tr>"
+        f"{rows}</table>"
+        f"<div style='color:#6b7280;font-size:12px;margin-top:6px'>showing "
+        f"{min(6,len(cards))} of {len(cards)}</div></div>")
+    md(f"**Saved to:** `{path}`\n\n"
+       "**Import into Anki:** *File → Import* → pick this file → set "
+       "**Field separator = Semicolon** → map **Field 1 → Front, Field 2 → Back** "
+       "(Field 3 is the source/topic, map it to a tag or extra field). "
+       "Allow HTML if your backs contain code.")
+    return path
+
+
+# ----------------------------------------------------------------------------
+# 9) cmd — reusable custom prompts ("/commands"), discoverable via TAB-complete
+# ----------------------------------------------------------------------------
+_CMD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "solveit_commands.json")
+
+# A few starters so `cmd.<TAB>` shows working examples immediately.
+_DEFAULT_COMMANDS = {
+    "eli5": "Explain this Python idea like I'm five, with one everyday analogy: {input}",
+    "analogy": "Give me a vivid real-world analogy for this Python concept: {input}",
+    "example": "Show ONE tiny runnable Python example (under 6 lines) of: {input}",
+    "realworld": "Where would a working programmer actually use this? Be concrete: {input}",
+    "cheatsheet": "Make a compact markdown-table cheat-sheet for: {input}",
+    "interview": "Ask me ONE beginner interview question (no answer yet) about: {input}",
+}
+
+
+class Commands:
+    """Reusable prompt templates — your notebook's version of `/commands`.
+
+    Type `cmd.` then press **TAB** to see all commands. Call one with your text:
+
+        cmd.eli5("recursion")
+        cmd.example("dictionary comprehension")
+
+    Make your own (saved to disk, reused every session):
+
+        cmd.add("roast", "Roast my Python code, then fix it kindly:\\n{input}")
+        cmd.roast("for i in range(len(xs)): print(xs[i])")
+
+    Templates use `{input}` for your text (or any named `{placeholders}` you
+    fill with keyword args). `cmd.list()` shows them; `cmd.remove("name")` drops one.
+    """
+
+    def __init__(self, path: str):
+        self._path = path
+        self._templates: dict[str, str] = {}
+        self._reserved = {"add", "remove", "list", "run"} | \
+            {a for a in dir(self.__class__) if not a.startswith("__")}
+        for name, tmpl in _DEFAULT_COMMANDS.items():
+            self.add(name, tmpl, _persist=False)
+        self._load()
+
+    @staticmethod
+    def _placeholders(template: str):
+        return [fn for _, fn, _, _ in _string.Formatter().parse(template) if fn]
+
+    def _make(self, name: str, template: str):
+        phs = self._placeholders(template)
+
+        def runner(*args, **kwargs):
+            fill = dict(kwargs)
+            remaining = [p for p in phs if p not in fill]
+            for p, val in zip(remaining, args):
+                fill[p] = val
+            extra = args[len(remaining):] if len(args) > len(remaining) else ()
+            try:
+                prompt = template.format(**{k: fill.get(k, "") for k in phs}) \
+                    if phs else template
+            except Exception:
+                prompt = template
+            if extra:                       # leftover positional text -> append
+                prompt = prompt + "\n\n" + " ".join(str(e) for e in extra)
+            if not phs and args:            # template has no slots: append input
+                prompt = template + "\n\n" + " ".join(str(a) for a in args)
+            _log(f"ran /{name}", " ".join(str(a) for a in args))
+            return ask(prompt, system=_TUTOR_SYSTEM, _loggable=False)
+
+        runner.__name__ = str(name)
+        runner.__doc__ = f"/{name} → {template}"
+        return runner
+
+    def add(self, name: str, template: str, *, _persist: bool = True):
+        """Register (and save) a reusable command. `cmd.add('name', 'template {input}')`."""
+        if not name.isidentifier() or name in self._reserved or name.startswith("_"):
+            raise ValueError(f"'{name}' is not a valid/allowed command name.")
+        self._templates[name] = template
+        setattr(self, name, self._make(name, template))
+        if _persist:
+            self._save()
+            md(f"✅ Saved command **/{name}** — type `cmd.{name}(\"...\")` "
+               "(or `cmd.` + TAB to find it).")
+
+    def remove(self, name: str):
+        """Delete a custom command."""
+        self._templates.pop(name, None)
+        if hasattr(self, name):
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass
+        self._save()
+        md(f"🗑️ Removed **/{name}**.")
+
+    def list(self):
+        """Show all available commands and their templates."""
+        rows = "".join(
+            f"<tr><td style='padding:4px 10px;border-bottom:1px solid #eee;"
+            f"font-weight:600;color:#4338ca'>cmd.{n}</td>"
+            f"<td style='padding:4px 10px;border-bottom:1px solid #eee;"
+            f"font-family:ui-monospace,monospace;font-size:12px'>"
+            f"{_html_escape(t)}</td></tr>"
+            for n, t in sorted(self._templates.items()))
+        html("<div style='font-family:system-ui,sans-serif'>"
+             "<b>🧩 Your commands</b> <span style='color:#6b7280;font-size:12px'>"
+             "(type <code>cmd.</code> then TAB)</span>"
+             "<table style='border-collapse:collapse;margin-top:6px'>"
+             f"{rows}</table></div>")
+
+    def _save(self):
+        try:
+            json.dump(self._templates, open(self._path, "w"), indent=2)
+        except Exception as e:  # non-fatal: commands still work this session
+            md(f"*(couldn't persist commands: {e})*")
+
+    def _load(self):
+        if os.path.exists(self._path):
+            try:
+                for n, t in json.load(open(self._path)).items():
+                    self.add(n, t, _persist=False)
+            except Exception:
+                pass
+
+
+cmd = Commands(_CMD_PATH)
+
+
+# ----------------------------------------------------------------------------
+# 10) edit — give the AI a code cell; it rewrites it in place + explains why
+# ----------------------------------------------------------------------------
+def _edit_code(code: str, instruction: str):
+    """Return (summary, edited_code) for an AI edit of `code`."""
+    raw = ask(
+        "You are editing a beginner's Python code. Apply this instruction "
+        f"(or, if blank, improve it):\n\nINSTRUCTION: {instruction or '(improve it)'}\n\n"
+        f"```python\n{code}\n```\n\n"
+        'Return ONLY JSON: {"summary": "one short line on what changed and why", '
+        '"code": "the full edited code"}. Keep it beginner-clear; only change '
+        "what the instruction asks for.",
+        system=_TUTOR_SYSTEM, render=False)
+    data = _extract_json(raw) or {}
+    return (data.get("summary") or instruction or "edited",
+            data.get("code") or code)
+
+
+def edit(code: str, instruction: str = ""):
+    """AI-edit a snippet and drop the result into a NEW cell (you review & run).
+
+    For an *in-place* edit of the current cell, use the `%%edit` magic instead.
+
+        edit('''for i in range(len(xs)): print(xs[i])''', "make it pythonic")
+    """
+    summary, new_code = _edit_code(code, instruction)
+    _log("edited code", summary)
+    _show_edit_summary(summary)
+    block = f"# ✏️ EDIT: {summary}\n{new_code}"
+    ip = get_ipython()
+    if ip is not None:
+        ip.set_next_input(block, replace=False)
+        return None
+    md(f"```python\n{block}\n```")
+    return new_code
+
+
+def _show_edit_summary(summary: str):
+    html("<div style='border-left:4px solid #6366f1;background:#eef2ff;"
+         "padding:8px 14px;border-radius:8px;font-family:system-ui,sans-serif'>"
+         f"✏️ <b>What changed:</b> {_html_escape(summary)}</div>")
+
+
+def _register_magics():
+    """Register the `%%edit` cell magic (in-place edit of THIS cell)."""
+    ip = get_ipython()
+    if ip is None:
+        return
+    from IPython.core.magic import register_cell_magic
+
+    @register_cell_magic
+    def edit(line, cell):  # noqa: A001  (magic name)
+        """%%edit <instruction>  — AI rewrites this cell's code in place + a comment."""
+        summary, new_code = _edit_code(cell, line.strip())
+        _log("edited code (in place)", summary)
+        _show_edit_summary(summary)
+        block = f"# ✏️ EDIT: {summary}\n{new_code}"
+        ip.set_next_input(block, replace=True)   # replace THIS cell's contents
+
+
+if _IN_NB:
+    try:
+        _register_magics()
+    except Exception:
+        pass
+
+
+def review(code: str) -> str:
+    """Review the student's OWN code: correctness, clarity, idioms."""
+    res = ask(
+        f"Review this beginner's Python code kindly but honestly:\n\n"
+        f"```python\n{code}\n```\n\n"
+        "Cover: (1) does it work / any bugs, (2) is it clear, (3) one or two "
+        "small idiomatic improvements. Keep it short and show tiny diffs only.",
+        system=_TUTOR_SYSTEM, _loggable=False)
+    _log("got a code review", code)
+    return res
+
+
+# ----------------------------------------------------------------------------
+# 5) propose — AI writes code into a NEW editable cell (you read/edit/run it)
+# ----------------------------------------------------------------------------
+def propose(task: str, *, context: str = "") -> str:
+    """Ask the AI for code, then drop it into a NEW cell below — NOT run.
+
+    This is the SolveIt move: the AI *proposes*, you stay the agent. You read
+    it, edit it, and decide to run it. Falls back to printing if not in Jupyter.
+
+        propose("read a CSV file called data.csv into a list of rows")
+    """
+    raw = ask(
+        f"Write a SHORT Python snippet (a few lines, beginner-friendly) for:\n\n"
+        f"{task}\n\n{('Context: ' + context) if context else ''}\n\n"
+        "Return ONLY the code, no markdown fences, no explanation. Add a brief "
+        "inline comment on tricky lines.",
+        system=_TUTOR_SYSTEM, render=False)
+    code = _strip_fences(raw)
+    _log("had AI propose code for", task)
+
+    ip = get_ipython()
+    if ip is not None:
+        md("🤖 *Proposed code dropped into a new cell below — read it, edit it, "
+           "then run it yourself.*")
+        ip.set_next_input(f"# 🤖 PROPOSED (review & edit before running)\n{code}",
+                          replace=False)
+        return None   # the code is now in a new cell; don't echo it here too
+    else:
+        md(f"```python\n{code}\n```")
+    return code
+
+
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t
+        if t.endswith("```"):
+            t = t.rsplit("```", 1)[0]
+        # drop a leading 'python' language tag if present
+        if t.lstrip().startswith("python\n"):
+            t = t.lstrip()[len("python\n"):]
+    return t.strip()
+
+
+# ----------------------------------------------------------------------------
+# Banner
+# ----------------------------------------------------------------------------
+__all__ = [
+    "ask", "Dialogue", "tutor", "Polya", "solve",
+    "explain", "explain_error", "hint", "quiz", "Quiz", "review",
+    "propose", "edit", "recap", "anki", "cmd", "Commands",
+    "session_log", "configure", "md", "html", "help_solveit",
+]
+
+
+def help_solveit():
+    md(textwrap.dedent("""
+    ### 🧰 solveit toolkit — quick reference
+
+    | function | what it does |
+    |---|---|
+    | `ask("...")` | one-shot question, answer rendered as Markdown |
+    | `tutor.ask("...")` | **persistent** tutor dialogue (remembers context) |
+    | `solve("problem")` | start a **Pólya** session → `.understand() .plan() .step() .review()` |
+    | `explain(x)` | explain a value or snippet at beginner level |
+    | `explain_error()` | explain the **last error** that occurred |
+    | `hint("...")` | a **Socratic** nudge — never the full answer |
+    | `quiz("topic")` | **interactive** quiz: type answers in boxes → AI-graded feedback |
+    | `review(code)` | review the student's *own* code |
+    | `propose("task")` | AI writes code into a **new editable cell** (you run it) |
+    | `%%edit <how>` | AI rewrites **this cell's** code in place + a comment |
+    | `edit(code, "how")` | same, but into a new cell |
+    | `cmd.<TAB>` | reusable custom prompts (`/commands`) — `cmd.eli5("loops")` |
+    | `cmd.add(name, tmpl)` | save your own command (persists across sessions) |
+    | `anki(focus="")` | export session to an **Anki**-importable `.txt` |
+    | `tutor.recap()` | **session summary** — what you covered & what to try next |
+
+    *The human is the agent: the AI proposes, **you** read, edit, and run.*
+    """).strip())
+
+
+if _IN_NB:
+    _b = _detect_backend()
+    md(f"✅ **solveit loaded** · backend=`{_b}` · model=`{_model_for(_b)}` · "
+       "type `help_solveit()` for the cheat-sheet.")
