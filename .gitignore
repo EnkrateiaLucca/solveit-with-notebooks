@@ -6,6 +6,7 @@ __pycache__/
 # Local, user-specific session state (auto-created)
 solveit_commands.json
 anki_exports/
+artifacts/
 
 # Env / secrets
 .env

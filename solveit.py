@@ -27,6 +27,7 @@ SOLVEIT_MODEL / SOLVEIT_BACKEND.
 from __future__ import annotations
 import os
 import sys
+import re
 import csv
 import json
 import string as _string
@@ -393,22 +394,115 @@ def solve(problem: str) -> Polya:
 # ----------------------------------------------------------------------------
 # 4) Teaching helpers
 # ----------------------------------------------------------------------------
+def _thing_body(thing) -> str:
+    """Describe `thing` for a prompt: code block if it looks like code, else value."""
+    if isinstance(thing, str) and ("\n" in thing or any(
+            k in thing for k in ("def ", "import ", "=", "(", "print"))):
+        return f"this Python code:\n\n```python\n{thing}\n```"
+    return f"this Python value: `{thing!r}` (type: {type(thing).__name__})"
+
+
 def explain(thing, *, level: str = "beginner") -> str:
     """Explain a value, an object, or a snippet of code in plain language.
 
     >>> explain([1, 2, 3])
     >>> explain("for i in range(3): print(i)")
     """
-    if isinstance(thing, str) and ("\n" in thing or any(
-            k in thing for k in ("def ", "import ", "=", "(", "print"))):
-        body = f"this Python code:\n\n```python\n{thing}\n```"
-    else:
-        body = f"this Python value: `{thing!r}` (type: {type(thing).__name__})"
-    res = ask(f"Explain {body}\n\nKeep it to a {level} level: a few short "
-              "sentences, one tiny analogy, no fluff.",
+    res = ask(f"Explain {_thing_body(thing)}\n\nKeep it to a {level} level: a few "
+              "short sentences, one tiny analogy, no fluff.",
               system=_TUTOR_SYSTEM, _loggable=False)
     _log("explored a concept", str(thing))
     return res
+
+
+# Builds a self-contained, interactive HTML "artifact" alongside the explanation.
+_ARTIFACT_SYSTEM = textwrap.dedent("""
+    You are a patient Python tutor who teaches with small INTERACTIVE artifacts.
+    You produce two things: a tiny plain-language explanation, then one
+    self-contained, interactive HTML artifact that lets a beginner *play* with
+    the idea (e.g. a slider that re-runs a loop, buttons that step through code,
+    a live visualization of a list being indexed).
+
+    Hard rules for the artifact:
+    - ONE complete HTML document: <!doctype html> ... </html>.
+    - ALL CSS and JS inline. No external requests, no CDNs, no fetch — it runs in
+      a sandboxed iframe with NO network and NO same-origin access.
+    - Vanilla JS only. It must visibly DO something the moment the user interacts.
+    - Clean, friendly look: system-ui font, generous spacing, rounded corners.
+    - Keep it focused on the ONE concept being explained; small, not a dashboard.
+""").strip()
+
+
+def _split_explanation_and_artifact(raw: str):
+    """Split an LLM reply into (markdown_explanation, html_document_or_None)."""
+    # Prefer an explicit ```html fence; fall back to any fenced block that is a doc.
+    m = re.search(r"```html\s*\n(.*?)```", raw, re.S | re.I)
+    if not m:
+        m = re.search(r"```\s*\n(\s*<(?:!doctype|html).*?)```", raw, re.S | re.I)
+    if not m:
+        return raw.strip(), None
+    explanation = raw[:m.start()].strip()
+    return explanation, m.group(1).strip()
+
+
+def _render_artifact(html_doc: str, *, title: str = "Interactive artifact",
+                     height: int = 420):
+    """Embed a self-contained HTML doc inline as a sandboxed, isolated iframe."""
+    # srcdoc must escape & and " so the whole document survives as one attribute.
+    srcdoc = html_doc.replace("&", "&amp;").replace('"', "&quot;")
+    html(
+        "<div style='font-family:system-ui,sans-serif;margin-top:6px'>"
+        "<div style='display:flex;align-items:center;gap:8px;"
+        "background:linear-gradient(135deg,#0ea5e9,#6366f1);color:white;"
+        "padding:8px 14px;border-radius:10px 10px 0 0;font-weight:700;font-size:14px'>"
+        f"🧪 {_html_escape(title)}"
+        "<span style='font-weight:400;opacity:.85;font-size:12px'>"
+        "· interactive — try it</span></div>"
+        f"<iframe sandbox='allow-scripts allow-popups' srcdoc=\"{srcdoc}\" "
+        f"style='width:100%;height:{height}px;border:1px solid #e5e7eb;"
+        "border-top:0;border-radius:0 0 10px 10px;background:white'></iframe></div>")
+
+
+def explain_with_artifacts(thing, *, level: str = "beginner",
+                           height: int = 420) -> str:
+    """Explain `thing` AND render an interactive HTML artifact inline.
+
+    Like `explain(...)`, but the AI also builds a small, self-contained,
+    *interactive* HTML widget (sliders, buttons, live visuals) that lets you
+    play with the idea right in the cell — Claude-style "artifacts", inline.
+
+        explain_with_artifacts("for i in range(3): print(i)")
+        explain_with_artifacts([10, 20, 30])           # visualize indexing
+        explain_with_artifacts("f-strings in Python")
+
+    Returns the raw explanation text (the artifact is rendered as a side effect).
+    """
+    raw = ask(
+        f"Explain {_thing_body(thing)}\n\n"
+        f"First, a {level}-level explanation: a few short sentences and one tiny "
+        "analogy, as markdown. Then, on its own, a single ```html fenced block "
+        "containing the COMPLETE interactive artifact for exactly this idea.",
+        system=_ARTIFACT_SYSTEM, render=False)
+    explanation, artifact = _split_explanation_and_artifact(raw)
+
+    if explanation:
+        md(explanation)
+    if artifact and _IN_NB:
+        _render_artifact(artifact, title=f"Explore: {str(thing)[:48]}",
+                         height=height)
+    elif artifact:  # headless: persist so it's still usable outside Jupyter
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "artifacts")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(out_dir, f"artifact-{stamp}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(artifact)
+        md(f"*Interactive artifact saved to* `{path}` *(open it in a browser).*")
+    elif not artifact:
+        md("*(No interactive artifact this time — here's the explanation above.)*")
+    _log("explained with an interactive artifact", str(thing))
+    return explanation
 
 
 def explain_error() -> str:
@@ -991,7 +1085,8 @@ def _strip_fences(text: str) -> str:
 # ----------------------------------------------------------------------------
 __all__ = [
     "ask", "Dialogue", "tutor", "Polya", "solve",
-    "explain", "explain_error", "hint", "quiz", "Quiz", "review",
+    "explain", "explain_with_artifacts", "explain_error", "hint",
+    "quiz", "Quiz", "review",
     "propose", "edit", "recap", "anki", "cmd", "Commands",
     "session_log", "configure", "md", "html", "help_solveit",
 ]
@@ -1007,6 +1102,7 @@ def help_solveit():
     | `tutor.ask("...")` | **persistent** tutor dialogue (remembers context) |
     | `solve("problem")` | start a **Pólya** session → `.understand() .plan() .step() .review()` |
     | `explain(x)` | explain a value or snippet at beginner level |
+    | `explain_with_artifacts(x)` | explain **+ an interactive HTML artifact** rendered inline |
     | `explain_error()` | explain the **last error** that occurred |
     | `hint("...")` | a **Socratic** nudge — never the full answer |
     | `quiz("topic")` | **interactive** quiz: type answers in boxes → AI-graded feedback |

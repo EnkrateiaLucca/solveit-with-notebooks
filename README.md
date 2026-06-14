@@ -67,6 +67,7 @@ Override the model anytime: `configure(model="gpt-5")` or env `SOLVEIT_MODEL`.
 | `tutor.ask("...")` | **Persistent** tutor dialogue that remembers prior turns |
 | `solve("problem")` | A **Pólya** session → `.understand() .plan() .step() .review()` |
 | `explain(x)` | Explain a value, object, or snippet at beginner level |
+| `explain_with_artifacts(x)` | Explain **+ a live interactive HTML artifact** embedded inline (sliders, steppers, visuals) |
 | `explain_error()` | Explain the **last exception** — run it after a failing cell |
 | `hint("...")` | A **Socratic** nudge — never the full answer |
 | `quiz("topic")` | **Interactive** quiz: type answers in boxes → AI-graded, color-coded feedback |
@@ -99,6 +100,16 @@ tutor.ask("Show me the tiniest example.")   # knows what you meant
 p = solve("Count the words in a sentence")
 p.understand(); p.plan(); p.step()
 ```
+
+**Learn by playing** — get an explanation *and* a live, interactive artifact in the cell:
+
+```python
+explain_with_artifacts("for i in range(3): print(i)")  # step through the loop
+explain_with_artifacts([10, 20, 30])                    # click to see indexing
+```
+
+The AI builds a small self-contained HTML widget (sliders, buttons, visuals) and
+embeds it inline in a sandboxed iframe — no copy-pasting, no external setup.
 
 **Reusable prompts, discoverable with TAB** (like `/commands`):
 
